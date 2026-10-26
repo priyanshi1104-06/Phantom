@@ -3,14 +3,14 @@
 // with buttons to jump to the line and to replay the input. The wording lives in findings.ts (tested);
 // this file only renders it. The webview runs no remote code and only posts button clicks back.
 import * as vscode from 'vscode';
-import { LAYER_NAMES, PanelView, tierLabel } from './findings';
+import { PanelView } from './findings';
 
-export type PanelAction = { type: 'reveal' | 'replay'; index: number } | { type: 'depth' | 'setUp' };
+export type PanelAction = { type: 'reveal' | 'replay'; index: number } | { type: 'depth' | 'setUp' | 'checkIntent' };
 
 export class PhantomPanel implements vscode.WebviewViewProvider, vscode.Disposable {
   static readonly id = 'phantom.panel';
   private view?: vscode.WebviewView;
-  private last?: { view: PanelView; depth: string; tier: string };
+  private last?: { view: PanelView; depth: string; models: string };
   private readonly listeners: vscode.Disposable[] = [];
 
   constructor(private readonly onAction: (action: PanelAction) => void) {}
@@ -23,15 +23,16 @@ export class PhantomPanel implements vscode.WebviewViewProvider, vscode.Disposab
     this.view = view;
     view.webview.options = { enableScripts: true, enableCommandUris: false };
     this.listeners.push(view.webview.onDidReceiveMessage((message: PanelAction) => {
-      if (message && ['reveal', 'replay', 'depth', 'setUp'].includes(message.type)) {
+      if (message && ['reveal', 'replay', 'depth', 'setUp', 'checkIntent'].includes(message.type)) {
         this.onAction(message);
       }
     }));
     this.render();
   }
 
-  show(view: PanelView, depth: string, tier: string): void {
-    this.last = { view, depth, tier };
+  /** depth: "Auto"; models: the tiers in use, "Swift / Balanced" (or "engine only"). */
+  show(view: PanelView, depth: string, models: string): void {
+    this.last = { view, depth, models };
     this.render();
   }
 
@@ -39,7 +40,7 @@ export class PhantomPanel implements vscode.WebviewViewProvider, vscode.Disposab
     if (!this.view || !this.last) {
       return;
     }
-    const { view, depth, tier } = this.last;
+    const { view, depth, models } = this.last;
     const nonce = Math.random().toString(36).slice(2);
     const cards = view.cards.map((card) => `
       <article class="card ${card.severity}">
@@ -47,6 +48,7 @@ export class PhantomPanel implements vscode.WebviewViewProvider, vscode.Disposab
           ${card.line ? `<span class="line">line ${card.line}</span>` : ''}</div>
         <code>${esc(card.call)}</code>
         <p>${esc(card.why)}</p>
+        ${card.because ? `<p class="assume">Why: ${esc(card.because)}</p>` : ''}
         ${card.assumptions.length ? `<p class="assume">Assumes: ${card.assumptions.map(esc).join('; ')}</p>` : ''}
         <p class="how">${esc(card.how)}</p>
         <div class="buttons">
@@ -67,6 +69,9 @@ export class PhantomPanel implements vscode.WebviewViewProvider, vscode.Disposab
           background: var(--vscode-editor-background); border-radius: 4px; }
   .card.warning { border-color: var(--vscode-editorWarning-foreground); }
   .card.info { border-color: var(--vscode-editorInfo-foreground); opacity: 0.85; }
+  .dot { display: inline-block; width: 8px; height: 8px; margin-right: 7px; border-radius: 50%; vertical-align: 1px;
+         background: #f14c4c; }
+  .warning .dot { background: #f0a030; } .info .dot { background: var(--vscode-editorInfo-foreground); }
   .head { font-weight: 600; } .line { float: right; font-weight: normal; color: var(--vscode-descriptionForeground); }
   code { display: block; margin: 6px 0; font-family: var(--vscode-editor-font-family); }
   p { margin: 4px 0; } .how, .assume { color: var(--vscode-descriptionForeground); font-size: 0.92em; }
@@ -77,10 +82,11 @@ export class PhantomPanel implements vscode.WebviewViewProvider, vscode.Disposab
   a { color: var(--vscode-textLink-foreground); cursor: pointer; }
 </style></head><body>
   <div class="bar"><span>${esc(view.title)}</span>
-    <a data-type="depth" title="Choose the depth and the tier of each layer">${esc(depth)} · ${esc(LAYER_NAMES.specter)} ${esc(tierLabel(tier))}</a></div>
+    <a data-type="depth" title="Choose the depth and the tier of each layer">${esc(depth)} · ${esc(models)}</a></div>
   <div class="bubble"><div class="who">Phantom</div>${esc(view.message)}
     ${view.risk ? `<div class="risk">This edit: ${esc(view.risk)}</div>` : ''}
-    ${/Set Up/.test(view.message) ? '<div class="buttons"><button data-type="setUp">Set Up</button></div>' : ''}</div>
+    <div class="buttons">${/Set Up/.test(view.message) ? '<button data-type="setUp">Set Up</button>' : ''}
+      <button data-type="checkIntent" title="Run the Analyst on this file now: wrong answers, not just crashes">Check intent</button></div></div>
   ${cards}
 <script nonce="${nonce}">
   const vscode = acquireVsCodeApi();

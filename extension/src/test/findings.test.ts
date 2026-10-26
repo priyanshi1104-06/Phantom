@@ -3,7 +3,7 @@ import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import {
   bugLine, bugMessage, chosenTiers, comingIn, confirmedBugs, DEPTHS, depthText, panelView, tierLabel, describeReplay, diagnosticLevel, Finding, lensTitle, Risk, riskText,
-  statusText, toZeroBased,
+  statusText, toZeroBased, wantsAnalyst,
 } from '../findings';
 
 const findings: Finding[] = [
@@ -52,8 +52,8 @@ test('messages name the failing input and the assumption', () => {
   assert.equal(bugMessage(firstWord),
     "Fails if text may be null (reproduced): firstWord(null) raises TypeError: Cannot read properties of null (reading 'trim')");
   assert.match(bugMessage(scale), /scale\(INT_MAX\) crashes with signed integer overflow/);
-  assert.match(lensTitle(average), /confirmed ZeroDivisionError {2}▶ Replay average\(\[\]\)/);
-  assert.match(lensTitle(scale), /^\$\(warning\) Phantom: assumed/);
+  assert.match(lensTitle(average), /^\u{1F534} Phantom: confirmed ZeroDivisionError {2}▶ Replay average\(\[\]\)/u);
+  assert.match(lensTitle(scale), /^\u{1F7E0} Phantom: assumed/u);
 });
 
 test('squiggle goes on the failing line, clamped to the document', () => {
@@ -78,7 +78,7 @@ test('status bar: counts, risk and escalation', () => {
   const bugs = confirmedBugs(findings);
   const risk: Risk = { level: 'high', edit_level: 'high', changed: ['pay'], escalate: 'oracle',
     reasons: [{ function: 'pay', category: 'payments', evidence: ['amount', 'balance'] }] };
-  assert.equal(statusText(bugs, 'docker', risk), '$(bug) Phantom: 3 confirmed · 1 assumed · risk high → Oracle');
+  assert.equal(statusText(bugs, 'docker', risk), '\u{1F534} Phantom: 3 confirmed · 1 assumed · risk high → Oracle');
   assert.equal(statusText([], 'local'), '$(check) Phantom: not sandboxed');
   assert.equal(statusText([], 'docker', { ...risk, level: 'low', escalate: null }), '$(check) Phantom');
   assert.equal(riskText({ ...risk, escalate: null, level: 'medium' }), 'risk medium');
@@ -88,13 +88,14 @@ test('depth and tier pickers never name a model or supplier', () => {
   const tiers = chosenTiers({ specter: 'balanced', analyst: 'claude-opus-5-5' });
   assert.deepEqual(tiers, { specter: 'balanced', analyst: 'balanced', oracle: 'deepest' });
   assert.equal(tierLabel('deep'), 'Deep');
-  assert.equal(depthText('auto', tiers, true), '$(layers) Auto · Specter Balanced');
+  assert.equal(depthText('auto', tiers, true), '$(layers) Auto · Balanced / Balanced');
+  assert.equal(depthText('specter', tiers, true), '$(layers) Specter only · Balanced');
   assert.equal(depthText('specter', tiers, false), '$(layers) Specter only · engine only');
-  assert.deepEqual(DEPTHS.map(comingIn), [undefined, undefined, 'coming in 0.2', 'coming in 0.3']);
+  assert.deepEqual(DEPTHS.map(comingIn), [undefined, undefined, undefined, 'coming in 0.3']);
 });
 
 test('the panel talks about the file and says how each bug was found', () => {
-  const view = panelView('samples/buggy.js', { findings });
+  const view = panelView('samples/crashes.js', { findings });
   assert.equal(view.message, 'I checked 7 functions. 3 inputs the types allow make the code fail; 1 more fails under an assumption; 1 only when handed null.');
   assert.equal(view.cards[0].severity, 'error');
   assert.equal(view.cards[0].how, "Found by Phantom's boundary inputs, proven by replaying it in a fresh sandbox.");
@@ -103,4 +104,48 @@ test('the panel talks about the file and says how each bug was found', () => {
   assert.match(panelView('a.py', { findings: [findings[5]] }).message, /no failing input.*isn't proof/);
   assert.match(panelView('a.py', { offline: true, problem: 'Python packages missing' }).message, /can't reach my backend/);
   assert.match(panelView('a.py', { running: true }).message, /^Checking/);
+  assert.equal(panelView('a.py', { findings: [] }).message, 'There are no functions in this file for me to check.');
+});
+
+const wrong: Finding[] = [
+  {
+    function: 'is_leap_year', def_line: 8, status: 'bug', severity: 'error', origin: 'example', layer: 'analyst',
+    assumptions: [], input: { call: 'is_leap_year(1900)', exprs: ['1900'] },
+    failure: { kind: 'wrong_result', error: 'WrongResult', message: 'returned True, expected False', line: 8 },
+    actual: 'True', expected: { value: 'False', basis: 'example', quote: '>>> is_leap_year(1900)', why: '' },
+  },
+  {
+    function: 'count_vowels', def_line: 30, status: 'bug', severity: 'warning', origin: 'intent', layer: 'analyst',
+    assumptions: [], input: { call: 'count_vowels("AEIOU")', exprs: ['"AEIOU"'] },
+    failure: { kind: 'wrong_result', error: 'WrongResult', message: 'returned 0, expected 5', line: 30 },
+    actual: '0', expected: { value: '5', basis: 'docstring', quote: 'upper or lower case', why: 'upper-case vowels count' },
+  },
+];
+
+test('Analyst: wrong results say what was expected and why', () => {
+  const [leap, vowels] = confirmedBugs(wrong);
+  assert.equal(bugMessage(leap), 'Wrong result (reproduced): is_leap_year(1900) returned True, expected False: ' +
+    'the code\'s own example says so: ">>> is_leap_year(1900)"');
+  assert.equal(bugMessage(vowels), 'Wrong result (reproduced): count_vowels("AEIOU") returned 0, expected 5: ' +
+    'upper-case vowels count (from its docstring: "upper or lower case")');
+  assert.equal(lensTitle(vowels), '\u{1F7E0} Phantom: wrong result, expected 5  ▶ Replay count_vowels("AEIOU")');
+  assert.equal(statusText(confirmedBugs([findings[0], ...wrong]), 'docker'), '\u{1F534} Phantom: 1 confirmed · 2 wrong results');
+  const view = panelView('intent.py', { findings: [findings[0], ...wrong] });
+  assert.equal(view.message, 'I checked 3 functions. 1 input the types allow makes the code fail; 2 calls give a wrong result.');
+  const card = view.cards.find((c) => c.function === 'count_vowels')!;
+  assert.equal(card.headline, 'Wrong result');
+  assert.equal(card.why, 'Returned 0, expected 5.');
+  assert.equal(card.because, 'Upper-case vowels count (from its docstring: "upper or lower case")');
+  assert.match(panelView('a.py', { findings: [], analysing: true, running: true }).message, /Analyst is checking/);
+  assert.equal(describeReplay('is_leap_year(1900)', { ok: false, kind: 'wrong_result', error: 'WrongResult',
+    message: 'returned True, expected False' }).summary, 'is_leap_year(1900) still returned True, expected False.');
+});
+
+test('when Analyst runs', () => {
+  const risky: Risk = { level: 'medium', edit_level: 'medium', changed: ['q'], escalate: 'analyst', reasons: [] };
+  assert.equal(wantsAnalyst('specter', risky, true), false);
+  assert.equal(wantsAnalyst('auto', undefined, false), false);
+  assert.equal(wantsAnalyst('auto', undefined, true), true);  // opened, saved or asked for
+  assert.equal(wantsAnalyst('auto', risky, false), true);
+  assert.equal(wantsAnalyst('analyst', undefined, false), true);
 });

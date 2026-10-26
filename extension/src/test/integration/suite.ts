@@ -1,4 +1,4 @@
-// Runs inside the test VS Code (see run.ts): open samples/buggy.py and check what the user would see.
+// Runs inside the test VS Code (see run.ts): open the samples and check what the user would see.
 import { strict as assert } from 'node:assert';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
@@ -34,7 +34,7 @@ export async function run(): Promise<void> {
   }
 
   // 1. Open the Python samples: every bug Specter reproduces shows up as a red squiggle.
-  const uri = vscode.Uri.file(path.join(process.env.PHANTOM_REPO!, 'samples', 'buggy.py'));
+  const uri = vscode.Uri.file(path.join(process.env.PHANTOM_REPO!, 'samples', 'crashes.py'));
   const doc = await vscode.workspace.openTextDocument(uri);
   await vscode.window.showTextDocument(doc);
   const bugs = await waitFor('9 functions with confirmed bugs', () => confirmed(uri),
@@ -75,16 +75,28 @@ export async function run(): Promise<void> {
   assert.match(hints[0].message, /undefined name 'nope'/);
 
   // 5. Another language: JavaScript. Red for inputs any caller could pass, faint hints for "fails on null".
-  const js = vscode.Uri.file(path.join(process.env.PHANTOM_REPO!, 'samples', 'javascript', 'buggy.js'));
+  const js = vscode.Uri.file(path.join(process.env.PHANTOM_REPO!, 'samples', 'javascript', 'crashes.js'));
   await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(js));
   const jsBugs = await waitFor('JavaScript bugs', () => confirmed(js),
     (d) => hasAll(d.map((x) => x.message), ['average', 'firstWord', 'lastPrice', 'padLabel', 'parsePort', 'collatzSteps', 'factorial']));
   assert.equal(jsBugs.find((d) => d.message.includes('average([])'))!.range.start.line, 7);
-  if (process.env.PHANTOM_TEST_SCREENSHOT) {  // for the docs: the Phantom panel next to buggy.js
+  if (process.env.PHANTOM_TEST_SCREENSHOT) {  // for the docs: the Phantom panel next to crashes.js
     await vscode.commands.executeCommand('workbench.view.extension.phantom');
     await sleep(4000);
     require('node:child_process').execFileSync('import', ['-window', 'root', process.env.PHANTOM_TEST_SCREENSHOT]);
   }
   const nullHints = vscode.languages.getDiagnostics(js).filter((d) => d.severity === vscode.DiagnosticSeverity.Hint);
   assert.ok(nullHints.some((d) => d.message.startsWith('Fails if text may be null')), 'a null-only hint');
+
+  // 6. Analyst ("Up to Analyst"): wrong results, from the code's own examples, with a Replay link each.
+  await vscode.workspace.getConfiguration('phantom').update('depth', 'analyst', vscode.ConfigurationTarget.Global);
+  const intent = vscode.Uri.file(path.join(process.env.PHANTOM_REPO!, 'samples', 'intent', 'intent.py'));
+  await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(intent));
+  const analyst = () => vscode.languages.getDiagnostics(intent).filter((d) => d.source === 'Phantom Analyst');
+  const wrong = await waitFor('three wrong results', analyst, (d) => d.length === 3);
+  assert.ok(wrong.some((d) => d.message.startsWith('Wrong result (reproduced): is_leap_year(1900) returned True, expected False')));
+  assert.ok(wrong.every((d) => d.severity === vscode.DiagnosticSeverity.Error), 'the code\'s own examples are errors');
+  const intentLenses = await vscode.commands.executeCommand<vscode.CodeLens[]>('vscode.executeCodeLensProvider', intent);
+  assert.ok(intentLenses.some((lens) => lens.command?.title.includes('wrong result, expected False')));
+  await vscode.workspace.getConfiguration('phantom').update('depth', undefined, vscode.ConfigurationTarget.Global);
 }

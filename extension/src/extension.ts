@@ -3,13 +3,15 @@
 //   2. Specter's triage (milliseconds)               -> risk of the edit in the status bar
 //   3. Specter's run (seconds)                       -> squiggles only for failures reproduced in the sandbox:
 //        red = fails on an input its types allow, yellow = needs an assumption, faint dots = only on null
+//   4. Analyst's run (seconds), depending on the depth -> wrong results, reproduced: red when the code's own
+//        example disagrees, yellow when the expected value is the AI's reading of the intent
 // and show a "Replay" link above each function with a confirmed or assumed bug.
 // The extension starts its own backend (server.ts); a second status item picks the depth and the models.
 import * as vscode from 'vscode';
 import {
   bugLine, bugMessage, chosenTiers, comingIn, ConfirmedBug, confirmedBugs, DEPTHS, depthText, describeReplay,
-  diagnosticLevel, escalationReason, Finding, Layer, LAYER_NAMES, lensTitle, panelView, ReplayResult,
-  Risk, StaticFinding, statusText, SUPPORTED_LANGUAGES, TIERS, tierLabel, toZeroBased,
+  diagnosticLevel, escalationReason, Finding, isWrongResult, Layer, LAYER_NAMES, lensTitle, panelView, ReplayResult,
+  Risk, StaticFinding, statusText, SUPPORTED_LANGUAGES, TIERS, tierLabel, toZeroBased, wantsAnalyst,
 } from './findings';
 import { PanelAction, PhantomPanel } from './panel';
 import { Backend } from './server';
@@ -20,7 +22,12 @@ interface FileState {
   staticDiagnostics: vscode.Diagnostic[];
   bugDiagnostics: vscode.Diagnostic[];
   bugs: ConfirmedBug[];
-  findings?: Finding[];  // everything the last run said, for the side panel
+  findings?: Finding[];  // everything the last runs said, for the side panel
+  specterFindings?: Finding[];
+  analystFindings: Finding[];  // kept between Analyst runs, minus functions edited since
+  analysing?: boolean;
+  saved?: boolean;  // saved (or "Check intent" asked) since the last run: in Auto, Analyst looks
+  analystDone?: boolean;  // Analyst has looked at this file since it was opened
   risk?: Risk;
   sandbox?: string;
   setup?: string;
@@ -33,19 +40,35 @@ interface SpecterAnswer {
   sandbox?: string;
   setup?: string;
   risk?: Risk;
+  model?: { available?: boolean };
+  findings: Finding[];
+}
+
+interface AnalystAnswer {
+  parsed: boolean;
+  setup?: string;
+  pending?: number;  // functions its AI hasn't read yet
   findings: Finding[];
 }
 
 const RETRY_MS = 5000;
+const ANALYST_ROUNDS = 3;  // Analyst runs again at once while its AI still has functions to read
 const SEVERITY = {
   error: vscode.DiagnosticSeverity.Error,
   warning: vscode.DiagnosticSeverity.Warning,
   hint: vscode.DiagnosticSeverity.Hint,
 };
 
+const WALKTHROUGH = 'phantom.phantom#phantom.welcome';
+
 export function activate(context: vscode.ExtensionContext): void {
   const phantom = new Phantom(context);
-  context.subscriptions.push(phantom);
+  context.subscriptions.push(phantom, vscode.commands.registerCommand('phantom.welcome',
+    () => vscode.commands.executeCommand('workbench.action.openWalkthrough', WALKTHROUGH, false)));
+  if (!context.globalState.get<boolean>('phantom.welcomed')) {  // first start after installing: say hello
+    void context.globalState.update('phantom.welcomed', true);
+    void vscode.commands.executeCommand('workbench.action.openWalkthrough', WALKTHROUGH, false);
+  }
 }
 
 export function deactivate(): void {}
@@ -55,6 +78,7 @@ class Phantom implements vscode.CodeLensProvider, vscode.Disposable {
   private readonly output = vscode.window.createOutputChannel('Phantom');
   private readonly status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
   private readonly depthStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
+  private readonly gutterDots: Record<'error' | 'warning', vscode.TextEditorDecorationType>;
   private readonly server: Backend;
   private readonly panel = new PhantomPanel((action) => void this.onPanelAction(action));
   private hasModels = false;
@@ -63,6 +87,7 @@ class Phantom implements vscode.CodeLensProvider, vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
   private running = 0;
   private offline = false;
+  private warnedOldBackend = false;
 
   readonly onDidChangeCodeLenses = this.lensesChanged.event;
 
@@ -70,8 +95,15 @@ class Phantom implements vscode.CodeLensProvider, vscode.Disposable {
     this.status.command = 'phantom.showOutput';
     this.depthStatus.command = 'phantom.chooseDepth';
     this.server = new Backend(context, (message) => this.log(message), () => this.config().backendUrl);
+    const dot = (name: string) => vscode.window.createTextEditorDecorationType({
+      gutterIconPath: vscode.Uri.joinPath(context.extensionUri, 'media', name), gutterIconSize: '70%',
+      overviewRulerLane: vscode.OverviewRulerLane.Left,
+    });
+    this.gutterDots = { error: dot('dot-error.svg'), warning: dot('dot-warning.svg') };
     this.disposables.push(
       this.diagnostics, this.output, this.status, this.depthStatus, this.lensesChanged, this.server, this.panel,
+      this.gutterDots.error, this.gutterDots.warning,
+      vscode.window.onDidChangeVisibleTextEditors(() => this.paintDots()),
       vscode.window.registerWebviewViewProvider(PhantomPanel.id, this.panel),
       vscode.commands.registerCommand('phantom.setUp', () => this.server.setUp().then(() => this.afterStart())),
       vscode.commands.registerCommand('phantom.setApiKey', () => this.server.askForKey().then(() => this.afterStart())),
@@ -81,11 +113,24 @@ class Phantom implements vscode.CodeLensProvider, vscode.Disposable {
       vscode.languages.registerCodeLensProvider(SUPPORTED_LANGUAGES.map((language) => ({ language })), this),
       vscode.workspace.onDidChangeTextDocument((e) => this.schedule(e.document)),
       vscode.workspace.onDidOpenTextDocument((doc) => this.schedule(doc, 0)),
+      vscode.workspace.onDidSaveTextDocument((doc) => {
+        if (this.supported(doc)) {
+          this.state(doc).saved = true;
+          this.schedule(doc, 0);
+        }
+      }),
       vscode.workspace.onDidCloseTextDocument((doc) => this.forget(doc)),
       vscode.window.onDidChangeActiveTextEditor(() => this.updateStatus()),
       vscode.workspace.onDidChangeConfiguration((e) => {
         if (e.affectsConfiguration('phantom')) {
           this.restart();
+        }
+      }),
+      vscode.commands.registerCommand('phantom.checkIntent', () => {
+        const doc = vscode.window.activeTextEditor?.document;
+        if (doc && this.supported(doc)) {
+          this.state(doc).saved = true;
+          this.schedule(doc, 0);
         }
       }),
       vscode.commands.registerCommand('phantom.analyze', () => {
@@ -104,9 +149,13 @@ class Phantom implements vscode.CodeLensProvider, vscode.Disposable {
   /** After the backend (re)started: learn whether models can be used, then analyse open files again. */
   private async afterStart(): Promise<void> {
     try {
-      const health = await (await fetch(this.config().backendUrl + '/health')).json() as { model?: { available?: boolean } };
+      const health = await (await fetch(this.config().backendUrl + '/health')).json() as {
+        model?: { available?: boolean }; layers?: Record<string, { built?: boolean }> };
       this.hasModels = !!health.model?.available;
       this.offline = false;
+      if (!health.layers?.analyst?.built) {
+        this.warnOldBackend();
+      }
     } catch {
       this.hasModels = false;
     }
@@ -130,7 +179,7 @@ class Phantom implements vscode.CodeLensProvider, vscode.Disposable {
     for (const layer of Object.keys(LAYER_NAMES) as Layer[]) {
       items.push({
         label: `$(sparkle) ${LAYER_NAMES[layer]}: ${tierLabel(config.tiers[layer])}`,
-        description: layer === 'specter' ? '' : `used from ${layer === 'analyst' ? '0.2' : '0.3'}`,
+        description: layer === 'oracle' ? 'used from 0.3' : '',
         run: () => this.chooseTier(layer),
       });
     }
@@ -164,11 +213,12 @@ class Phantom implements vscode.CodeLensProvider, vscode.Disposable {
     const state = doc && this.supported(doc) ? this.files.get(doc.uri.toString()) : undefined;
     const file = doc && this.supported(doc) ? vscode.workspace.asRelativePath(doc.uri) : '';
     const view = doc && this.supported(doc)
-      ? panelView(file, { findings: state?.findings, running: this.running > 0, offline: this.offline, setup: state?.setup,
-        problem: this.server.problem, risk: state?.risk })
+      ? panelView(file, { findings: state?.findings, running: this.running > 0, analysing: state?.analysing,
+        offline: this.offline, setup: state?.setup, problem: this.server.problem, risk: state?.risk })
       : { title: 'Phantom', risk: '', cards: [], message: 'Open a file in a language I know and I\'ll check it as you type.' };
     const depth = DEPTHS.find((d) => d.id === config.depth)?.label ?? 'Auto';
-    this.panel.show(view, depth, config.tiers.specter);
+    const models = depthText(config.depth, config.tiers, this.hasModels).replace(/^.*? · /, '');
+    this.panel.show(view, depth, models);
   }
 
   private async onPanelAction(action: PanelAction): Promise<void> {
@@ -177,6 +227,9 @@ class Phantom implements vscode.CodeLensProvider, vscode.Disposable {
     }
     if (action.type === 'setUp') {
       return void vscode.commands.executeCommand('phantom.setUp');
+    }
+    if (action.type === 'checkIntent') {
+      return void vscode.commands.executeCommand('phantom.checkIntent');
     }
     const editor = vscode.window.activeTextEditor;
     const state = editor ? this.files.get(editor.document.uri.toString()) : undefined;
@@ -257,7 +310,7 @@ class Phantom implements vscode.CodeLensProvider, vscode.Disposable {
     const key = doc.uri.toString();
     let state = this.files.get(key);
     if (!state) {
-      state = { staticDiagnostics: [], bugDiagnostics: [], bugs: [] };
+      state = { staticDiagnostics: [], bugDiagnostics: [], bugs: [], analystFindings: [] };
       this.files.set(key, state);
     }
     return state;
@@ -330,17 +383,25 @@ class Phantom implements vscode.CodeLensProvider, vscode.Disposable {
       if (stale() || !answer.parsed) {
         return;
       }
+      if (answer.model) {  // the AI can fail after start-up (a key that is refused): keep the status bar honest
+        this.hasModels = !!answer.model.available;
+      }
       state.sandbox = answer.sandbox;
       state.setup = answer.setup;
       state.risk = answer.risk ?? state.risk;
-      state.findings = answer.findings;
-      state.bugs = confirmedBugs(answer.findings);
-      state.bugDiagnostics = state.bugs.map((bug) => this.bugDiagnostic(doc, bug));
-      this.publish(doc);
-      const errors = state.bugs.filter((b) => b.severity === 'error').length;
+      state.specterFindings = answer.findings;
+      const edited = new Set(state.risk?.changed ?? []);  // Analyst's results for these are out of date
+      state.analystFindings = state.analystFindings.filter((f) => !edited.has(f.function));
+      this.show(doc, state);
+      const errors = state.bugs.filter((b) => b.severity === 'error' && !isWrongResult(b)).length;
       this.log(`${vscode.workspace.asRelativePath(doc.uri)}: ${errors} confirmed, ` +
-        `${state.bugs.length - errors} under an assumption` +
+        `${state.bugs.filter((b) => !isWrongResult(b)).length - errors} under an assumption` +
         (answer.setup ? ` (no ${doc.languageId} sandbox yet: run  ${answer.setup})` : ''));
+      const prompted = !!state.saved || !state.analystDone;  // saved, asked for, or opened
+      state.saved = false;
+      if (!answer.setup && wantsAnalyst(this.config().depth, state.risk, prompted)) {
+        await this.analyst(doc, state, body, stale, controller.signal);
+      }
     } catch (error) {
       if (controller.signal.aborted) {
         return;
@@ -360,13 +421,72 @@ class Phantom implements vscode.CodeLensProvider, vscode.Disposable {
     }
   }
 
-  /** Log once per edit that needs a deeper layer (Analyst and Oracle are the next layers to build). */
+  /** Specter's and Analyst's findings together: squiggles, lenses, the panel. */
+  private show(doc: vscode.TextDocument, state: FileState): void {
+    state.findings = [...(state.specterFindings ?? []), ...state.analystFindings];
+    state.bugs = confirmedBugs(state.findings);
+    state.bugDiagnostics = state.bugs.map((bug) => this.bugDiagnostic(doc, bug));
+    this.publish(doc);
+  }
+
+  /** Analyst after Specter: wrong results. Runs again at once while its AI has functions left to read. */
+  private async analyst(doc: vscode.TextDocument, state: FileState, body: object, stale: () => boolean,
+    signal: AbortSignal): Promise<void> {
+    state.analysing = true;
+    this.updateStatus();
+    try {
+      for (let round = 0; round < ANALYST_ROUNDS; round++) {
+        const answer = await this.post<AnalystAnswer>(
+          '/analyst', { ...body, model: this.config().useModel, models: this.config().tiers }, signal);
+        if (stale() || !answer.parsed) {
+          return;
+        }
+        state.analystDone = true;
+        state.analystFindings = answer.findings;
+        this.show(doc, state);
+        const wrong = confirmedBugs(answer.findings).length;
+        this.log(`${vscode.workspace.asRelativePath(doc.uri)}: Analyst found ${wrong} wrong result${wrong === 1 ? '' : 's'}` +
+          (answer.pending ? ` (${answer.pending} functions still to read)` : ''));
+        if (!answer.pending) {
+          return;
+        }
+      }
+    } catch (error) {  // Specter's results stay; the Analyst's failure is said, not retried in a loop
+      if (signal.aborted) {
+        return;
+      }
+      state.analystDone = true;
+      this.log(`Analyst failed: ${error}`);
+      if (/HTTP 404/.test(String(error))) {
+        this.warnOldBackend();
+      }
+    } finally {
+      state.analysing = false;
+      this.updateStatus();
+    }
+  }
+
+  /** The backend answering is an older Phantom without the Analyst (e.g. one still running from 0.1). */
+  private warnOldBackend(): void {
+    if (this.warnedOldBackend) {
+      return;
+    }
+    this.warnedOldBackend = true;
+    this.log(`The backend at ${this.config().backendUrl} is an older Phantom without the Analyst.`);
+    void vscode.window.showWarningMessage(
+      'Phantom: an older Phantom backend is still running, so the Analyst can\'t run. Close VS Code completely ' +
+      '(every window) and open it again, or stop any terminal running "python -m backend".', 'Show log')
+      .then((choice) => choice && this.output.show(true));
+  }
+
+  /** Log once per edit that needs a deeper layer. */
   private noteEscalation(doc: vscode.TextDocument, state: FileState): void {
     const risk = state.risk;
     const key = risk?.escalate ? `${risk.escalate}:${risk.changed.join(',')}` : undefined;
     if (risk?.escalate && key !== state.escalated) {
       this.log(`${vscode.workspace.asRelativePath(doc.uri)}: this edit is ${risk.edit_level} risk ` +
-        `(${escalationReason(risk)}) → ${risk.escalate === 'oracle' ? 'Oracle' : 'Analyst'} should look`);
+        `(${escalationReason(risk)}) → ${risk.escalate === 'oracle' ? 'Oracle should look (0.3); Analyst checks it now'
+          : 'Analyst checks it'}`);
     }
     state.escalated = key;
   }
@@ -401,19 +521,31 @@ class Phantom implements vscode.CodeLensProvider, vscode.Disposable {
     const range = new vscode.Range(line.lineNumber, line.firstNonWhitespaceCharacterIndex, line.lineNumber, line.text.length);
     const level = diagnosticLevel(bug);
     const diagnostic = new vscode.Diagnostic(range, bugMessage(bug), SEVERITY[level]);
-    diagnostic.source = 'Phantom';
-    diagnostic.code = level === 'error' ? 'confirmed' : 'assumed';
+    diagnostic.source = isWrongResult(bug) ? 'Phantom Analyst' : 'Phantom';
+    diagnostic.code = isWrongResult(bug) ? 'wrong-result' : level === 'error' ? 'confirmed' : 'assumed';
     return diagnostic;
   }
 
   private publish(doc: vscode.TextDocument): void {
     const state = this.state(doc);
     this.diagnostics.set(doc.uri, [...state.staticDiagnostics, ...state.bugDiagnostics]);
+    this.paintDots();
     this.lensesChanged.fire();
     this.updateStatus();
   }
 
-  provideCodeLenses(doc: vscode.TextDocument): vscode.CodeLens[] {
+/** Phantom's red (or amber) dot in the gutter, beside each line it has a reproduced bug on. */
+  private paintDots(): void {
+    for (const editor of vscode.window.visibleTextEditors) {
+      const bugs = this.files.get(editor.document.uri.toString())?.bugs ?? [];
+      for (const level of ['error', 'warning'] as const) {
+        const lines = bugs.filter((bug) => bug.severity === level).map((bug) => bugLine(bug, editor.document.lineCount));
+        editor.setDecorations(this.gutterDots[level], [...new Set(lines)].map((line) => editor.document.lineAt(line).range));
+      }
+    }
+  }
+
+    provideCodeLenses(doc: vscode.TextDocument): vscode.CodeLens[] {
     const bugs = (this.files.get(doc.uri.toString())?.bugs ?? []).filter((bug) => bug.severity !== 'info');
     return bugs.map((bug) => {
       const line = toZeroBased(bug.def_line ?? bug.failure.line ?? 1, doc.lineCount);
@@ -478,7 +610,8 @@ class Phantom implements vscode.CodeLensProvider, vscode.Disposable {
     try {
       const result = await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: `Phantom: replaying ${call} in a fresh sandbox...` },
-        () => this.post<ReplayResult>('/replay', { ...this.request(doc), function: bug.function, input: bug.input }));
+        () => this.post<ReplayResult>('/replay',
+          { ...this.request(doc), function: bug.function, input: bug.input, expected: bug.expected?.value }));
       const { summary, details } = describeReplay(call, result);
       this.log(`Replay: ${summary}${details ? '\n' + details : ''}`);
       if (result.ok === true) {

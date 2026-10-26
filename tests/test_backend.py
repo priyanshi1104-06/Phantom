@@ -13,7 +13,7 @@ from runner.context import function_context, missing_context, top_level_names
 from runner.static import static_findings
 
 PY = languages.get("python")
-BUGGY = (Path(__file__).resolve().parent.parent / "samples" / "buggy.py").read_text()
+BUGGY = (Path(__file__).resolve().parent.parent / "samples" / "crashes.py").read_text()
 
 FILE = '''import math
 from collections import Counter
@@ -80,6 +80,7 @@ class BackendTest(unittest.TestCase):
         self.assertIn("typescript", health["languages"]["typescript"]["vscode_ids"])
         self.assertIn("available", health["model"])
         self.assertTrue(health["layers"]["specter"]["built"])
+        self.assertTrue(health["layers"]["analyst"]["built"])
         self.assertFalse(health["layers"]["oracle"]["built"])
         self.assertEqual([t["id"] for t in health["tiers"]], ["swift", "balanced", "deep", "deepest"])
         self.assertNotIn("claude", json.dumps(health["tiers"]))  # the editor never sees a supplier
@@ -113,7 +114,7 @@ class BackendTest(unittest.TestCase):
 
     def test_specter_finds_and_caches(self):
         start = time.monotonic()
-        first = self.client.post("/specter", json={"source": BUGGY, "path": "/w/buggy.py", "model": False}).json()
+        first = self.client.post("/specter", json={"source": BUGGY, "path": "/w/crashes.py", "model": False}).json()
         cold = time.monotonic() - start
         findings = {f["function"]: f for f in first["findings"]}
         self.assertEqual(findings["average"]["status"], "bug")
@@ -124,10 +125,10 @@ class BackendTest(unittest.TestCase):
         # Edit one function: only that one runs again, and triage sees which function changed.
         edited = BUGGY.replace("return sum(values) / len(values)",
                                "return sum(values) / len(values) if values else 0.0")
-        triage = self.client.post("/triage", json={"source": edited, "path": "/w/buggy.py"}).json()
+        triage = self.client.post("/triage", json={"source": edited, "path": "/w/crashes.py"}).json()
         self.assertEqual(triage["risk"]["changed"], ["average"])
         start = time.monotonic()
-        second = self.client.post("/specter", json={"source": edited, "path": "/w/buggy.py", "model": False}).json()
+        second = self.client.post("/specter", json={"source": edited, "path": "/w/crashes.py", "model": False}).json()
         second = {f["function"]: f for f in second["findings"]}
         self.assertEqual(second["average"]["status"], "no_bug_found")
         self.assertEqual(second["factorial"], findings["factorial"])
@@ -156,6 +157,18 @@ class BackendTest(unittest.TestCase):
         self.assertEqual(fixed, {"ok": True, "result": 3.0})
         gone = self.client.post("/replay", json={"source": BUGGY, "function": "nope", "args": []}).json()
         self.assertIsNone(gone["ok"])
+
+    def test_analyst_and_replay_with_the_expected_value(self):
+        source = (Path(__file__).resolve().parent.parent / "samples" / "intent" / "intent.py").read_text()
+        answer = self.client.post("/analyst", json={"source": source, "path": "intent.py", "model": False}).json()
+        leap = next(f for f in answer["findings"] if f["function"] == "is_leap_year")
+        self.assertEqual((leap["layer"], leap["failure"]["kind"], leap["input"]["call"]),
+                         ("analyst", "wrong_result", "is_leap_year(1900)"))
+        body = {"source": source, "path": "intent.py", "function": "is_leap_year", "input": leap["input"],
+                "expected": leap["expected"]["value"]}
+        self.assertEqual(self.client.post("/replay", json=body).json()["message"], "returned True, expected False")
+        fixed = source.replace("return year % 4 == 0", "return year % 4 == 0 and year % 100 != 0")
+        self.assertTrue(self.client.post("/replay", json={**body, "source": fixed}).json()["ok"])
 
     def test_browser_requests_are_refused(self):
         response = self.client.post("/static", json={"source": "x = 1"}, headers={"Origin": "https://evil.example"})
