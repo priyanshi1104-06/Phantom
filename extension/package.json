@@ -4,14 +4,47 @@
   "description": "Finds bugs while you type, in Python, JavaScript, TypeScript, Go, Java, C, C++, Rust, Ruby and PHP: crashes and wrong answers, each backed by an input reproduced in a sandbox.",
   "version": "0.2.3",
   "publisher": "phantom",
-  "license": "UNLICENSED",
+  "license": "SEE LICENSE IN LICENSE.md",
+  "icon": "media/icon.png",
+  "homepage": "https://d15m91ite2ed7m.cloudfront.net",
+  "bugs": {
+    "email": "priyanshi.thakor1104@gmail.com"
+  },
+  "pricing": "Free",
+  "qna": false,
+  "galleryBanner": {
+    "color": "#0b0b0d",
+    "theme": "dark"
+  },
+  "categories": [
+    "Linters",
+    "Testing",
+    "Debuggers"
+  ],
+  "keywords": [
+    "bug finder",
+    "static analysis",
+    "fuzzing",
+    "sandbox",
+    "testing",
+    "ai",
+    "python",
+    "javascript",
+    "typescript",
+    "go",
+    "java",
+    "c",
+    "c++",
+    "rust",
+    "ruby",
+    "php",
+    "code review",
+    "heisenbug"
+  ],
   "private": true,
   "engines": {
     "vscode": "^1.100.0"
   },
-  "categories": [
-    "Linters"
-  ],
   "activationEvents": [
     "onLanguage:c",
     "onLanguage:cpp",
@@ -274,7 +307,7 @@
     "test": "npm run compile && node --test out/test/*.test.js",
     "test:integration": "npm run compile && node out/test/integration/run.js",
     "bundle": "node scripts/bundle-server.js",
-    "package": "npm run compile && npm run bundle && vsce package --allow-missing-repository --skip-license"
+    "package": "npm run compile && npm run bundle && vsce package --allow-missing-repository"
   },
   "devDependencies": {
     "@types/node": "22.20.5",
@@ -282,10 +315,5 @@
     "@vscode/test-electron": "3.1.0",
     "@vscode/vsce": "^3.6.2",
     "typescript": "7.0.2"
-  },
-  "icon": "media/icon.png",
-  "galleryBanner": {
-    "color": "#0b0b0d",
-    "theme": "dark"
   }
 }
